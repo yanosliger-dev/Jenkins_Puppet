@@ -8,7 +8,7 @@ The goal is simple:
 
 - Start with a fresh Linux server
 - Run one command
-- End up with Jenkins running and reachable on port 8000
+- End up with Jenkins running and reachable on port 8000 ( can be changed in vars )
 
 No manual steps, no clicking around, no post-install tweaking required.
 
