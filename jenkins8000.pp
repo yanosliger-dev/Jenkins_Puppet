@@ -75,7 +75,7 @@ if $osfam == 'Debian' {
     require => [Exec['apt_update'], Package['openjdk-17-jre-headless']],
   }
 
-  # ---- Force port via systemd ExecStart override (authoritative on Ubuntu 22.04) ----
+  # ---- Force port via systemd ExecStart override (authoritative) ----
   file { '/etc/systemd/system/jenkins.service.d':
     ensure  => directory,
     mode    => '0755',
@@ -89,10 +89,10 @@ if $osfam == 'Debian' {
     mode    => '0644',
     content => $override_content,
     require => File['/etc/systemd/system/jenkins.service.d'],
-    notify  => Exec['systemd_daemon_reload'],
+    notify  => Exec['systemd_daemon_reload_debian'],
   }
 
-  exec { 'systemd_daemon_reload':
+  exec { 'systemd_daemon_reload_debian':
     command     => '/bin/systemctl daemon-reload',
     path        => ['/bin', '/usr/bin'],
     refreshonly => true,
@@ -103,50 +103,43 @@ if $osfam == 'Debian' {
     require => Package['jenkins'],
   }
 
-  # ---- Tidy optional unlock output (single notify; no exec spam) ----
-  if $show_jenkins_unlock {
-    if file($jenkins_unlock_file) {
-      notify { 'jenkins_setup':
-        message => "Jenkins setup:\n  URL:    http://localhost:${jenkins_port}/login\n  Unlock: ${file($jenkins_unlock_file)}\n  Note:   Disable via \$show_jenkins_unlock=false",
-        require => Service['jenkins'],
-      }
-    } else {
-      notify { 'jenkins_setup_pending':
-        message => "Jenkins setup: unlock token not available yet (${jenkins_unlock_file}). Jenkins may still be initializing.\nDisable via \$show_jenkins_unlock=false",
-        require => Service['jenkins'],
-      }
-    }
-  }
-
 } elsif $osfam == 'RedHat' {
 
   # ---- RHEL / Rocky / Alma ----
 
-  package { ['ca-certificates', 'curl', 'fontconfig']:
+  # gnupg2 is needed because we use gpg to check the key fingerprint
+  # firewalld is used to open the Jenkins port for remote access
+  package { ['ca-certificates', 'curl', 'fontconfig', 'gnupg2', 'firewalld']:
     ensure => installed,
   }
 
+  # Ensure firewalld is running
+  service { 'firewalld':
+    ensure => running,
+    enable => true,
+  }
+
   exec { 'download_jenkins_key_redhat':
-    command => '/usr/bin/curl -fsSL -o /etc/pki/rpm-gpg/RPM-GPG-KEY-jenkins https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key',
+    command => '/usr/bin/curl -fsSL -o /etc/pki/rpm-gpg/RPM-GPG-KEY-jenkins https://pkg.jenkins.io/rpm-stable/jenkins.io-2026.key',
     path    => ['/usr/bin', '/bin'],
-    creates => '/etc/pki/rpm-gpg/RPM-GPG-KEY-jenkins',
     require => Package['curl'],
+    unless  => '/bin/sh -c "test -f /etc/pki/rpm-gpg/RPM-GPG-KEY-jenkins && gpg --quiet --with-fingerprint /etc/pki/rpm-gpg/RPM-GPG-KEY-jenkins 2>/dev/null | grep -q \"6366 7EE7 4BBA 1F0A 08A6 9872 5BA3 1D57 EF59 75CA\" "',
   }
 
   exec { 'import_jenkins_key_redhat':
-    command => '/usr/bin/rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-jenkins',
-    path    => ['/usr/bin', '/bin', '/usr/sbin', '/sbin'],
-    require => Exec['download_jenkins_key_redhat'],
-    unless  => '/bin/sh -c "rpm -q gpg-pubkey --qf \"%{SUMMARY}\n\" | grep -qi jenkins || true"',
+    command     => '/usr/bin/rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-jenkins',
+    path        => ['/usr/bin', '/bin', '/usr/sbin', '/sbin'],
+    refreshonly => true,
+    subscribe   => Exec['download_jenkins_key_redhat'],
   }
 
   yumrepo { 'jenkins':
-    baseurl  => 'https://pkg.jenkins.io/redhat-stable',
+    baseurl  => 'https://pkg.jenkins.io/rpm-stable',
     descr    => 'Jenkins-stable',
     enabled  => 1,
     gpgcheck => 1,
     gpgkey   => 'file:///etc/pki/rpm-gpg/RPM-GPG-KEY-jenkins',
-    require  => [Exec['import_jenkins_key_redhat'], Exec['download_jenkins_key_redhat']],
+    require  => Exec['import_jenkins_key_redhat'],
     notify   => Exec['dnf_makecache'],
   }
 
@@ -166,33 +159,54 @@ if $osfam == 'Debian' {
     require => [Exec['dnf_makecache'], Package['java-17-openjdk-headless']],
   }
 
-  exec { 'set_jenkins_port_redhat':
-    command => "/bin/sh -c 'if grep -qE \"^JENKINS_PORT=\" /etc/sysconfig/jenkins; then sed -i \"s/^JENKINS_PORT=.*/JENKINS_PORT=${jenkins_port}/\" /etc/sysconfig/jenkins; else echo \"JENKINS_PORT=${jenkins_port}\" >> /etc/sysconfig/jenkins; fi'",
-    path    => ['/usr/bin', '/bin'],
+  # ---- Force port via systemd override on RHEL-family too ----
+  # On some Rocky/RHEL installs the unit hardcodes --httpPort=8080, ignoring /etc/sysconfig/jenkins.
+  file { '/etc/systemd/system/jenkins.service.d':
+    ensure  => directory,
+    mode    => '0755',
     require => Package['jenkins'],
-    unless  => "/bin/sh -c 'grep -qE \"^JENKINS_PORT=${jenkins_port}$\" /etc/sysconfig/jenkins'",
-    notify  => Service['jenkins'],
+  }
+
+  $override_content_rh = "[Service]\nExecStart=\nExecStart=${jenkins_java} -Djava.awt.headless=true -jar ${jenkins_war} --webroot=${jenkins_webroot} --httpPort=${jenkins_port}\n"
+
+  file { '/etc/systemd/system/jenkins.service.d/override.conf':
+    ensure  => file,
+    mode    => '0644',
+    content => $override_content_rh,
+    require => File['/etc/systemd/system/jenkins.service.d'],
+    notify  => Exec['systemd_daemon_reload_redhat'],
+  }
+
+  exec { 'systemd_daemon_reload_redhat':
+    command     => '/bin/systemctl daemon-reload',
+    path        => ['/bin', '/usr/bin'],
+    refreshonly => true,
+    notify      => Service['jenkins'],
+  }
+
+  # ---- Open firewall for Jenkins port (RHEL-family) ----
+  exec { 'firewalld_open_jenkins_port':
+    command => "/bin/sh -c 'firewall-cmd --permanent --add-port=${jenkins_port}/tcp && firewall-cmd --reload'",
+    path    => ['/bin', '/usr/bin', '/usr/sbin', '/sbin'],
+    require => Service['firewalld'],
+    unless  => "/bin/sh -c 'firewall-cmd --list-ports | tr \" \" \"\\n\" | grep -qx \"${jenkins_port}/tcp\"'",
   }
 
   Service['jenkins'] {
     require => Package['jenkins'],
   }
 
-  # ---- Tidy optional unlock output (single notify; no exec spam) ----
-  if $show_jenkins_unlock {
-    if file($jenkins_unlock_file) {
-      notify { 'jenkins_setup_rh':
-        message => "Jenkins setup:\n  URL:    http://localhost:${jenkins_port}/login\n  Unlock: ${file($jenkins_unlock_file)}\n  Note:   Disable via \$show_jenkins_unlock=false",
-        require => Service['jenkins'],
-      }
-    } else {
-      notify { 'jenkins_setup_pending_rh':
-        message => "Jenkins setup: unlock token not available yet (${jenkins_unlock_file}). Jenkins may still be initializing.\nDisable via \$show_jenkins_unlock=false",
-        require => Service['jenkins'],
-      }
-    }
-  }
-
 } else {
   fail("Unsupported OS family: ${osfam}. Supported: Debian/Ubuntu and RedHat family.")
 }
+
+# ---- Optional unlock output (single place; applies to all OSes) ----
+# Kept out of OS blocks so it isn't duplicated.
+if $show_jenkins_unlock {
+  exec { 'show_jenkins_unlock_token':
+    command => "/bin/sh -c 'if [ -f \"${jenkins_unlock_file}\" ]; then echo \"Jenkins setup:\"; echo \"  URL:    http://localhost:${jenkins_port}/login\"; echo -n \"  Unlock: \"; cat \"${jenkins_unlock_file}\"; echo; echo \"  Note:   Disable via \\$show_jenkins_unlock=false\"; else echo \"Jenkins setup: unlock token not available yet (${jenkins_unlock_file}).\"; echo \"Disable via \\$show_jenkins_unlock=false\"; fi'",
+    path    => ['/bin', '/usr/bin'],
+    require => Service['jenkins'],
+  }
+}
+

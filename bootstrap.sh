@@ -22,6 +22,23 @@ detect_os_like() {
   fi
 }
 
+# Resolve puppet binary reliably (works for distro puppet and puppet-agent installs)
+find_puppet() {
+  if command -v puppet >/dev/null 2>&1; then
+    echo "$(command -v puppet)"
+    return 0
+  fi
+  if [[ -x /opt/puppetlabs/bin/puppet ]]; then
+    echo "/opt/puppetlabs/bin/puppet"
+    return 0
+  fi
+  if [[ -x /usr/local/bin/puppet ]]; then
+    echo "/usr/local/bin/puppet"
+    return 0
+  fi
+  return 1
+}
+
 disable_broken_jenkins_repo_debian() {
   local repo="/etc/apt/sources.list.d/jenkins.list"
   local disabled="/etc/apt/sources.list.d/jenkins.list.disabled"  # NOT .list
@@ -57,14 +74,14 @@ install_puppet_debian() {
   echo "deb [signed-by=/usr/share/keyrings/puppet.gpg] https://apt.puppet.com ${codename} puppet7" > /etc/apt/sources.list.d/puppet.list
   apt-get update -y
   apt-get install -y puppet-agent
-  ln -sf /opt/puppetlabs/bin/puppet /usr/local/bin/puppet
+  # (No symlink required; we resolve the binary reliably via find_puppet)
 }
 
 install_puppet_redhat() {
   log "Detected RHEL-family. Installing Puppet..."
   dnf -y install ca-certificates curl
 
-  # Try distro puppet first
+  # Try distro puppet first (may not exist on EL9)
   if dnf -y install puppet; then
     return
   fi
@@ -74,7 +91,7 @@ install_puppet_redhat() {
   major="$(rpm -E %rhel)"
   dnf -y install "https://yum.puppet.com/puppet7-release-el-${major}.noarch.rpm"
   dnf -y install puppet-agent
-  ln -sf /opt/puppetlabs/bin/puppet /usr/local/bin/puppet
+  # (No symlink required; we resolve the binary reliably via find_puppet)
 }
 
 fetch_manifest() {
@@ -98,13 +115,21 @@ fetch_manifest() {
 
 run_puppet() {
   log "Running Puppet manifest..."
-  puppet --version
-  puppet apply /root/jenkins8000.pp
+
+  local puppet_bin
+  if ! puppet_bin="$(find_puppet)"; then
+    echo "ERROR: puppet not found even after installation." >&2
+    echo "Tried: puppet in PATH, /opt/puppetlabs/bin/puppet, /usr/local/bin/puppet" >&2
+    exit 1
+  fi
+
+  "$puppet_bin" --version
+  "$puppet_bin" apply /root/jenkins8000.pp
 }
 
 verify_jenkins_port() {
   log "Verifying Jenkins is listening on port ${PORT}..."
-  for i in {1..30}; do
+  for i in {1..90}; do
     if ss -lntp 2>/dev/null | grep -q ":${PORT}"; then
       log "OK: Jenkins is listening on ${PORT}"
       return 0
@@ -144,3 +169,4 @@ main() {
 }
 
 main "$@"
+
