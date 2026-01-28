@@ -33,7 +33,7 @@ Install Java (OpenJDK 17) and Jenkins
 
 Force Jenkins to listen on port 8000
 
-This is done explicitly via a systemd override on Ubuntu to avoid distro quirks
+Explicitly enforced via a systemd override on Ubuntu to avoid distro quirks
 
 Start and enable the Jenkins service
 
